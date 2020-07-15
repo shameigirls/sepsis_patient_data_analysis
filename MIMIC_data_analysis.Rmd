@@ -1,0 +1,810 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+#  Cohort Building
+
+## 0. Getting Ready
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(lubridate)
+Sys.setenv(TZ='UTC')
+```
+
+
+## 1. Building a Cohort Based on Inclusion Criteria and Defining Endpoints
+### Loading Data
+
+Patients age 15 years or greater at ICU admission with at least one assessment each of GCS, BUN, hematocrit, and heart rate recorded in the EHR.
+
+call `head` and `str` on each dataframe to get a feel for what is contained in each column.
+
+```{r}
+vitals_cohort_sirs <- read_csv("./data/vitals_cohort_sirs.csv")
+labs_cohort <- read_csv("./data/labs_cohort.csv")
+head(vitals_cohort_sirs)
+head(labs_cohort)
+str(vitals_cohort_sirs)
+str(labs_cohort)
+```
+
+
+The Systemic Inflammatory Response Syndrome (SIRS) criteria has been an integral tool for the clinical definition of sepsis for the past several decades. In the TREWScore paper, the authors considered a patient to have sepsis if at least two of the four SIRS criteria were simultaneously met during an admission where a suspicion of infection was also present.
+
+The four SIRS criteria are as follows:
+1. Temperature > 38&deg;C or < 36&deg;C
+2. Heart Rate > 90
+3. Respiratory Rate > 20 or PaCO$_{2}$< 32mmHg
+4. WBC > 12,000/$mm^{3}$, < 4000/$mm^{3}$, or > 10% bands
+
+
+The next step in our process will be to assess whether patients satisfy each of the SIRS criteria at each time step that vitals or lab data is available. To this end, we would like to have a dataframe where each row corresponds to a unique combination of *subject_id*, *hadm_id*, *icustay_id*, and *charttime*, and with one column for each unique type of lab or vital that was measured at that time. 
+
+```r
+labs_per_px_time <- vitals_cohort %>%
+    group_by(subject_id, hadm_id, icustay_id, charttime, lab_id) %>%
+    summarise(n = n())
+```
+
+Implement a solution to summarize the values by calculating the mean value for each patient at a given time point. One approach could use the `group_by`, `summarise` and `ungroup` commands from `dplyr`.
+
+```{r}
+labs_per_px_time <- labs_cohort %>%
+    group_by(subject_id, hadm_id, icustay_id, charttime, lab_id) %>%
+    summarise(mean_valuenum=mean(valuenum)) 
+  
+vitals_per_px_time <- vitals_cohort_sirs %>%
+    group_by(subject_id, hadm_id, icustay_id, charttime, vital_id) %>%
+    summarise(mean_valuenum=mean(valuenum))   
+```
+
+
+Pivot on *lab_id* and *vital_id* again and  use `str` to inspect the resulting dataframes. In other words, create a new column for each unique measurement type in labs and vitals data frames where the rows are given by unique combinations of *subject_id*, *hadm_id*, *icustay_id*, *charttime*, *vital_id*. If a complete set of measurements is not available in a particular row of the resulting dataframe, fill in the value with an `NA`. A solution could use `spread` from `dplyr` or `dcast` from `data.table`.
+
+```{r}
+labs_per_px_time_spread <- spread(labs_per_px_time, lab_id, mean_valuenum)
+vitals_per_px_time_spread <- spread(vitals_per_px_time, vital_id, mean_valuenum)
+```
+
+
+Since the measurement times for the vital signs may be different from those of the labs, the next step is to merge the vitals and labs dataframes together to get the full timeline for each patient. 
+
+Using a command such as `full_join` or `merge`, merge the pivoted labs and vitals dataframes generated previously, using the common columns in the two dataframes. There should be one row for each unique combination of *subject_id*, *hadm_id*, *icustay_id*, *charttime*, *vital_id* observed in either dataframe.
+
+```{r}
+merge_labs_vitals <- merge(labs_per_px_time_spread, vitals_per_px_time_spread, all = TRUE)
+```
+
+Use a last-value-carried-forward approach within an ICU stay to fill in missing values.
+
+```{r}
+# library(zoo)
+# locf <- na.locf(merge_labs_vitals, na.rm = FALSE)
+```
+
+
+```{r}
+lvcf <- merge_labs_vitals %>%
+  group_by(icustay_id) %>%
+  fill(ALBUMIN:TempC) %>%
+  ungroup()
+```
+
+Now we have a record of the most recent value for each lab or vital within an ICU stay for each patient in our development set. From this data, create a new dataframe called *SIRS* that has a record for each row in timeline dataframe developed previously and a column indicating whether each of the SIRS criteria were satisfied at each chart time, and a final column indicating whether at least 2 of the SIRS criteria were satisfied. Assume that if a value is unknown that the patient does not meet that SIRS criterion.
+
+```{r}
+
+SIRS <- data.frame(charttime=lvcf$charttime,
+                   subject_id=lvcf$subject_id,
+                   icustay_id=lvcf$icustay_id,
+                   hadm_id=lvcf$hadm_id,
+                   temperature=(lvcf$TempC>38|lvcf$TempC<36) & is.na(lvcf$TempC)==FALSE,
+                   heart=lvcf$HeartRate>90 & is.na(lvcf$HeartRate)==FALSE,
+                   resp_paco2=ifelse(is.na(lvcf$RespRate>20|lvcf$PaCO2<32),FALSE,
+                                     lvcf$RespRate>20|lvcf$PaCO2<32),
+                   wbc=ifelse(is.na(lvcf$WBC<4|lvcf$WBC>12|lvcf$BANDS>10),FALSE,
+                                     lvcf$WBC<4|lvcf$WBC>12|lvcf$BANDS>10))
+SIRS <- SIRS %>% 
+  mutate(sirsqualify=ifelse(temperature+heart+resp_paco2+wbc>=2,"satisfied","unsatisfied"))
+sum(SIRS$sirsqualify=="satisfied")
+
+```
+
+
+At this point, we have computed the SIRS criteria for every patient in our cohort. Now it's time to determine which patients had suspicion of infection. In the TREWScore paper, the authors use a set of ICD9 codes to identify infection-related diagnoses.
+
+```{r}
+# Provided
+infection3digit <- c('001','002','003','004','005','008',
+                     '009','010','011','012','013','014','015','016','017','018',
+                     '020','021','022','023','024','025','026','027','030','031',
+                     '032','033','034','035','036','037','038','039','040','041',
+                     '090','091','092','093','094','095','096','097','098','100',
+                     '101','102','103','104','110','111','112','114','115','116',
+                     '117','118','320','322','324','325','420','421','451','461',
+                     '462','463','464','465','481','482','485','486','494','510',
+                     '513','540','541','542','566','567','590','597','601','614',
+                     '615','616','681','682','683','686','730'
+                     )
+infection4digit <- c('5695','5720','5721','5750','5990','7110',
+                     '7907','9966','9985','9993'
+                     )
+infection5digit <- c('49121','56201','56203','56211','56213','56983')
+infection_codes <- c(infection3digit, infection4digit, infection5digit)
+
+diagnosis <- read.csv("./data/diagnoses.csv")
+ICD9_code <- diagnosis%>%
+  mutate(three=str_sub(icd9_code,1,3) %in% 
+           infection3digit)%>%
+  mutate(four=str_sub(icd9_code,1,4) %in% 
+           infection4digit)%>%  
+  mutate(five=str_sub(icd9_code,1,5) %in% 
+           infection5digit)%>%
+  filter(three==TRUE|four==TRUE|five==TRUE)
+```
+
+
+In the paper, the authors also consider a patient to have infection during an admission if there is at least one mention of 'sepsis' or 'septic' in a clinical note for the admission.
+
+Load the notes data from *notes.csv* into a dataframe
+```{r}
+notes <- read_csv("./data/notes.csv")
+notes_infection=notes%>%
+  mutate(infection=str_detect(text, 'sepsis|septic'))%>%
+  filter(infection)
+```
+
+At this stage, we now have all the information we need to determine the times that patients meet the criteria for sepsis. Join the results from the search for patients with infection codes and sepsis notes with SIRS data frame and label the chart times that meet the TREWScore paper's definition of sepsis.
+
+```{r}
+sepsis <- SIRS%>%
+  mutate(sepsis=hadm_id %in% 
+           c(ICD9_code$hadm_id,notes_infection$hadm_id) & sirsqualify=="satisfied")
+```
+
+
+
+#### 1.11
+
+In the TREWScore paper, the authors also identify patients with **severe sepsis** and **septic shock**. Severe sepsis is defined as sepsis with **organ dysfunction**. Septic shock is defined as **severe sepsis**, **hypotension**, and **adequate fluid resuscitation** occurring at the same time.  In order to determine which patients met the criteria for *severe sepsis* and *septic shock* according to the TREWScore paper, we will first need to define the concepts of **organ dysfunction**, **adequate fluid resuscitation**, and **hypotension**.
+
+Unfortunately, the criteria the authors use to define organ dysfunction is rather cumbersome. Instead of implementing that criteria explicitly, we adopt a simpler approach. In the Angus 2001 paper (linked at the top of the assignment), the authors did just that by defining a set of ICD9 codes as a proxy for sepsis-related organ dysfunction. 
+
+```{r}
+code_prefixes <- c('458','293','570','584', '7855','3483','3481', '2874','2875','2869','2866','5734')
+code_prefixes_3digits <- c('458','293','570','584')
+code_prefixes_4digits <- c('7855','3483','3481', '2874','2875','2869','2866','5734')
+ICD9_code_organ=diagnosis%>%
+  mutate(organ_three=str_sub(icd9_code,1,3) %in% code_prefixes_3digits)%>%
+  mutate(organ_four=str_sub(icd9_code,1,4) %in% code_prefixes_4digits)%>%
+  filter(organ_three==TRUE|organ_four==TRUE)
+
+severe_sepsis <- sepsis %>%
+  mutate(severe_sepsis = hadm_id %in% ICD9_code_organ$hadm_id & sepsis=="TRUE")
+
+```
+
+#### 1.12 Tying it all together
+
+```{r}
+fluids_all <- read_csv("./data/fluids_all.csv")
+hypotension_labels <- read_csv("./data/hypotension_labels.csv")
+
+merge_ss_fluids <- merge(severe_sepsis, fluids_all, all=TRUE)
+merge_ss_fluids_hypo <- merge(merge_ss_fluids, hypotension_labels, all=TRUE)
+
+septic_shock_fillna <- merge_ss_fluids_hypo %>%
+  group_by(subject_id, hadm_id, icustay_id) %>%
+  fill(c(severe_sepsis,adequate_fluid,hypotension)) %>%
+  ungroup()
+
+septic_shock <- septic_shock_fillna %>%
+  mutate(septic_shock = severe_sepsis & adequate_fluid & hypotension)
+```
+
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(data.table)
+library(Matrix)
+library(glmnet)
+Sys.setenv(TZ='UTC')
+
+```
+
+
+## 1. Defining labels for prediction
+
+
+##### 1.1
+
+The prediction problem motivating this assignment is to predict, at 12 hours into an admission, whether septic shock will occur during the remainder of the admission, with at least 3 hours of lead time. 
+
+We will derive the **labels** and **index times** in a way that aligns with the task description above. Note that this is not the same procedure as in the TREWscore paper.
+
+We will use the following definitions:                         
+
+* We will only assign labels to admissions of at least twelve hours in duration.
+* An admission is assigned a negative label if septic shock does not occur at any time during the admission.
+* An admission is assigned a positive label if septic shock occurs fifteen hours after admission or later.
+* Admissions where the earliest time of septic shock occurs prior to fifteen hours after admission are removed from the study.
+* For admissions that have valid labels, we assign an index time at twelve hours into the admission. For prediction, we only use information that occurs before the index time.
+* In the case that a patient has multiple admissions for which a valid index time and label may be assigned, we only use the latest one.
+
+To begin, given the above definitions, load `cohort_labels.csv` and `ADMISSIONS.csv` derive the binary classification labels for septic shock and the corresponding index times for each patient in the dataframe. The result should be a dataframe with one row per patient and additional columns for `index_time` and `label`.
+
+```{r}
+cohort_labels <- read_csv("./data/cohort_labels.csv")
+admissions <- read_csv("./data/ADMISSIONS.csv")
+admissions <- admissions %>%
+  select(2:5)
+colnames(admissions)=c("subject_id","hadm_id","admittime","dischtime")
+cohort_labels_time=merge(cohort_labels,admissions,all.y=T)
+
+cohort_labels_time_12=cohort_labels_time %>%
+  filter(dischtime>=admittime+hours(12))
+
+remove_15=cohort_labels_time %>%
+  filter(charttime<admittime+hours(15)) %>%
+  group_by(hadm_id) %>%
+  summarise(y_15=sum(septic_shock)!=FALSE) %>%
+  filter(y_15==TRUE)%>%
+  pull(hadm_id)
+
+label_patients_15=cohort_labels_time_12 %>%
+  filter(hadm_id %in% remove_15==FALSE) %>%
+  mutate(index_time=admittime+hours(12))%>%
+  group_by(subject_id,hadm_id,index_time) %>%
+  summarise(patient_label=ifelse(is.na(sum(septic_shock)),FALSE,sum(septic_shock)!=FALSE))%>%
+  ungroup() 
+
+label_patients=label_patients_15 %>%
+  group_by(subject_id) %>%
+  filter(index_time==max(index_time)) %>%
+  ungroup()
+
+n_negative=sum(label_patients$patient_label == FALSE)
+n_positive=sum(label_patients$patient_label == TRUE)
+n_positive
+n_negative
+
+```
+
+----
+
+
+## 2. Building a Patient-Feature Matrix for the Septic Shock Cohort
+
+Now that we know have derived labels and index times for each patient in our cohort, we can start to engineer some features from the data that occur prior to the index times and will be useful for predicting onset of septic shock.
+
+### Diagnoses
+
+##### 2.1 
+
+Let's first deal with diagnoses. Load `diagnoses_icd.csv`. We would like to find the diagnoses that occurred before the index time for each patient, but it looks like there is no time recorded in the diagnosis table.
+
+```{r}
+diagnosis <- read_csv("./data/DIAGNOSES_ICD.csv")
+```
+
+----
+
+
+##### 2.2
+
+```{r}
+colnames(diagnosis)=c("row_id","subject_id","hadm_id","seq-num","icd9_code")
+diagnosis_time <- merge(diagnosis, admissions)
+diagnosis_time_index <- merge(diagnosis_time, label_patients,by="subject_id")
+colnames(diagnosis_time_index)[c(2,7)] <-c("hadm_id","diagnosis_time")
+
+prior_index=diagnosis_time_index %>%   
+  filter(diagnosis_time < index_time)%>%
+  select(subject_id, hadm_id, diagnosis_time, icd9_code, index_time)
+
+length(unique(prior_index$subject_id))
+```
+
+The resulting might make sense.
+----
+
+
+##### 2.3
+
+```{r}
+n_icd9_p=prior_index %>%
+  group_by(icd9_code)%>%
+  summarise(n_icd9_p=n_distinct(subject_id))%>%
+  ungroup()
+
+head(arrange(n_icd9_p,desc(n_icd9_p)), n = 10)
+head(arrange(n_icd9_p,desc(n_icd9_p)), n = 3)
+```
+
+4019: Unspecified essential hypertension
+4280: Congestive heart failure, unspecified
+41401: Crnry athrscl natve vssl (Coronary atherosclerosis of native coronary artery)
+
+----
+
+
+##### 2.4
+
+For the set of codes and patients that remain after the index time filtering step, make a histogram demonstrating the distribution of the number of unique diagnostic histories that the codes belong to. 
+
+```{r}
+his_dis=n_icd9_p %>%
+  ggplot(aes(x=n_icd9_p)) +
+  geom_histogram()+
+  xlab("number of admissions that a code belongs to the history of")+
+  ylab("number of codes that were observed in the same number of admissions")
+
+his_dis
+```
+
+Interpret: There are many rare diagnoses, resulting in a sparse feature space.
+----
+
+
+##### 2.5
+
+The IC of a feature that occurs in a set of records is calculated as 
+
+$-log_2 \left( \frac{count(\text{feature})}{count(\text{record})} \right)$
+
+Use this equation to calculate the IC of ICD9 codes based on their occurrence in the diagnosis records for the sepsis cohort.
+
+```{r}
+IC_record=sum(n_icd9_p$n_icd9_p)
+IC_icd9=n_icd9_p %>%
+  mutate(IC=-log2(n_icd9_p/IC_record))
+```
+
+----
+
+##### 2.6
+```{r}
+range(IC_icd9$IC)
+head(arrange(IC_icd9,desc(IC)), n = 10)
+```
+
+The top 10 most specific ICD9 codes: 0030,0049,0051,00581,00841,0085,01085,01190,01194,01215
+
+---
+
+
+##### 2.7
+Filter the set of ICD9 codes for the diagnoses associated with the set of admissions to those with an IC between 6 and 10.
+
+```{r}
+IC_icd9=IC_icd9%>%
+  filter(IC>6, IC<10)
+```
+
+---
+
+
+##### 2.8
+Now we have our diagnoses features and the times they occured for each patient. All that is left to do is to create a patient-feature matrix that summarizes and organizes the diagnoses features. In this matrix, each row is an patient and each column is a diagnosis code, time binned by whether or not it occured in the preceeding 6 months prior to the index time. In other words, we are going to generate two features for each diagnosis code where one feature represents the count of the number of times the code was observed in the six months prior to the index time and the other features represents the number of times that code was observed in the medical history older than six months.
+
+Given the sparsity of the feature space, we are not going to directly instantiate the resulting wide feature matrix since it is inefficient to do. Instead, we aim to generate a long three column matrix with the columns `subject_id`, `feature_name`, and `feature_value`.
+
+```{r}
+in_sixm=prior_index %>%
+  filter(icd9_code %in% IC_icd9$icd9_code) %>%
+  filter(diagnosis_time+days(180)>index_time) %>%
+  mutate(icd9_code=paste(icd9_code,"prior_sixm",sep=""))%>%
+  group_by(subject_id,icd9_code) %>%
+  summarise(n_ob=n())
+
+out_sixm=prior_index %>%
+  filter(icd9_code %in% IC_icd9$icd9_code) %>%
+  filter(diagnosis_time+days(180)<index_time) %>%
+  mutate(icd9_code=paste(icd9_code,"post_sixm",sep=""))%>%
+  group_by(subject_id,icd9_code) %>%
+  summarise(n_ob=n())
+
+prior_post_sixm=union_all(in_sixm, out_sixm) 
+colnames(prior_post_sixm) <- c("subject_id","feature_name","feature_value")
+
+dim(prior_post_sixm)
+
+```
+
+----
+
+### Vitals
+
+
+##### 2.9
+
+```{r}
+"./data/vitals_cohort_sirs.csv"%>%
+  read_csv() -> vitals_cohort_sirs
+
+vitals_label=merge(vitals_cohort_sirs, label_patients,by="subject_id") %>%
+  filter(vital_id=="HeartRate", charttime<index_time) %>%
+  select("subject_id","hadm_id.x","charttime","valuenum","index_time","patient_label")
+colnames(vitals_label)[2]="hadm_id"
+
+length(unique(vitals_label$hadm_id))
+```
+
+----
+
+
+##### 2.10
+
+One feature of interest might be the latest value of the heart rate before the cutoff time. Make a dataframe with four columns: `subject_id`, `hadm_id`, `latest_heart_rate`, and `charttime`. 
+
+```{r}
+
+latest_hr=vitals_label %>%
+  group_by(subject_id) %>%
+  filter(charttime==max(charttime)) %>%
+  select("subject_id","hadm_id","valuenum","charttime","patient_label","index_time") %>%
+  ungroup()
+
+# Duplicate max chartimes are found
+latest_hr=latest_hr %>%
+  group_by(subject_id,hadm_id,charttime,patient_label,index_time) %>%
+  summarise(valuenum=mean(valuenum))%>%
+  ungroup()
+
+colnames(latest_hr)[colnames(latest_hr)=="valuenum"] = "latest_heart_rate"
+
+ave_latest_hr=mean(latest_hr$latest_heart_rate)
+ave_latest_hr
+
+his_hr=latest_hr %>%
+  ggplot(aes(x=latest_heart_rate, color=patient_label))+
+  geom_histogram()+
+  xlab("latest heart rate")+
+  ylab("number of latest heart rate")
+
+his_hr
+```
+
+----
+
+
+##### 2.11
+
+```{r}
+dp_timediff <- latest_hr %>%
+  ggplot(aes(x=difftime(index_time,charttime,units='hours'),color=patient_label)) +
+  geom_density()+
+  xlab("time difference between the latest heart rate recording")
+
+dp_timediff_rev <- latest_hr %>%
+  ggplot(aes(x=difftime(index_time,charttime,units='hours'),color=patient_label)) +
+  geom_density()+
+  xlim(0,3)+
+  xlab("time difference between the latest heart rate recording")
+
+dp_timediff
+dp_timediff_rev
+```
+
+----
+
+
+##### 2.12
+Some patients might have many heart rate recordings, and only using the last one might not be the best idea- it's possible the latest measurement is an outlier. Let's try to leverage all the heart rate measurements we have by creating a time-weighted average heart rate. Use the formula $w = e^{(-|\Delta t| - 1)}$ to calculate the weights of each measurement, where $\Delta t$ is the time difference between the measurement time and the cutoff time in hours. Calculate the weighted average with the formula $\bar{x}_w = \sum(x_i w_i)/\sum(w_i)$. The result should be a dataframe with two columns: `subject_id` and `time_wt_avg`.
+
+```{r}
+tw_ave_hr <- vitals_label%>%
+  mutate(weight=exp(as.numeric(-abs(difftime(index_time,charttime,units='hours'))-1)))%>%
+  group_by(subject_id)%>%
+  summarise(time_wt_avg=ifelse(sum(weight)==0, mean(valuenum), sum(valuenum*weight)/sum(weight)))%>%
+  ungroup()
+
+all_time_wt_avg <- mean(tw_ave_hr$time_wt_avg)
+all_time_wt_avg
+```
+
+----
+
+
+##### 2.13
+
+Make a scatterplot of the latest recorded heart rate (x-axis) and the time-weighted average heart rate (y-axis) of each patient.
+
+```{r}
+plot(latest_hr$latest_heart_rate,tw_ave_hr$time_wt_avg,xlab = "latest recorded heart rate",ylab="time-weighted average heart rate")
+```
+
+----
+
+
+##### 2.14
+
+```{r}
+mod_latest_hr=latest_hr %>%
+  select("subject_id", "latest_heart_rate") %>%
+  mutate(feature_name="latest heart rate")
+colnames(mod_latest_hr)[colnames(mod_latest_hr)=="latest_heart_rate"] = "feature_value"
+
+mod_tw_ave_hr=tw_ave_hr %>%
+  mutate(feature_name="time weighted heart rate") 
+colnames(mod_tw_ave_hr)[colnames(mod_tw_ave_hr)=="time_wt_avg"] = "feature_value"
+
+latest_tw_ave=union_all(mod_latest_hr, mod_tw_ave_hr)%>%
+  select("subject_id","feature_name","feature_value")
+```
+
+----
+
+### Stitching together Disease and Vitals Features
+
+
+##### 2.15
+
+```{r}
+
+patient_feature_matrix= union_all(latest_tw_ave, prior_post_sixm)
+NROW(unique(patient_feature_matrix$feature_name))
+
+```
+
+
+## 3. Classification
+
+##### 3.1 Open-ended feature engineering 
+
+Five new MIMIC tables:
+prescriptions.csv: the columns of"drug","drug_name","startdate","enddate","dose_val_rx","dose_unit_rx", to develop the feature of time since first antibiotics
+
+cptevents.csv: the columns of "cpt_number","sectionheader" and "subsectionheader", to develop the feature of cardiac surgery patient
+
+procedures_icd.cvs: the columns of "icd9_code", to develop the feature of Immunocompromised(a patient who received past therapy that suppresses resistance to infection)
+
+noteevents.csv: the columns of "text","category","discription", could be able to develop the feature of Chronic renal insufficiency (if possible)
+
+services.csv: the columns of "prev_service","curr_service", could be able to develop the feature of cardiac surgery patient, or human immunodeficiency virus (HIV)
+
+----
+
+
+##### 3.2 Logistic regression classifier
+
+```{r}
+# Baseline implementation - provided
+library(Matrix)
+library(glmnet)
+
+## Example of how to create sparse matrix
+subject_map <- patient_feature_matrix %>% select(subject_id) %>% distinct() %>% mutate(subject_idx = 1:n())
+feature_map <- patient_feature_matrix %>% select(feature_name) %>% distinct() %>% mutate(feature_idx = 1:n())
+features <- patient_feature_matrix %>% left_join(subject_map) %>% left_join(feature_map)
+subject_map <- subject_map %>% left_join(label_patients[, c('subject_id', 'patient_label')]) %>% mutate(label = as.factor(patient_label)) 
+
+## Create the sparse matrix
+sparse_features <- sparseMatrix(i = features$subject_idx, j = features$feature_idx, x = features$feature_value)
+label_vector <- subject_map$label
+
+## Fit the model with cross validation
+model_cv <- cv.glmnet(sparse_features, label_vector, nfolds = 10, family = "binomial", type.measure = "auc")
+
+## Plot the result
+plot(model_cv)
+```
+
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## 1. Preprocessing
+
+### 1.1 Creating Feature Matrix and Outcome Vector
+
+Split the patient matrix up into a numerical matrix of features and a character vector of the outcome (died or survived). For the feature matrix, exclude the subject ID and the outcome variable and use `data.matrix()`. 
+
+```{r}
+patient_feature = patient_feature_matrix[,-(1:2)]
+patient_feature = data.matrix(patient_feature)
+outcome_character = as.vector(patient_feature_matrix$death_in_stay)
+```
+
+
+
+### 1.2  Removing Uninformative Features
+
+Before we do any modeling, let's cut down on our feature space by removing low-variance features that probably aren't useful enough to measure association with or use in a predictive model. `caret` has a function to do that, so let's use it instead of reinventing the wheel. 
+
+```{r}
+remove_lowv = nearZeroVar(patient_feature, saveMetrics = FALSE)
+patient_feature_lm = patient_feature[ , -remove_lowv]
+dim(patient_feature_lm)
+
+feature_descriptions %>%
+  group_by(feature_type) %>%
+  summarise(n=n())
+
+feature_descriptions_lm = feature_descriptions %>%
+  filter(feature_descriptions$feature %in% colnames(patient_feature_lm))
+
+feature_descriptions_lm %>%
+  group_by(feature_type) %>%
+  summarise(n=n())
+```
+
+
+## 2. Associative Analyses
+
+### 2.1 Hypothesis testing
+
+#### 2.1.1 Statistical Tests of Differences Between Two Groups
+
+For the features `alarms` (chart indicator), `activity` (chart indicator), `respiratory rate` (chart value), `arterial PaCO2` (chart value), `oxy_drop` (engineered feature) and `snomed ct concept` (note CUI), use a t-test, rank-sum test, Fisher exact test, or a $\chi^2$ (chi squared) test (whichever is most appropriate) to determine if each of these features is associated with mortality. 
+
+```{r}
+alarms = patient_feature_matrix$chartindicator_1622
+hist(alarms)
+#t.test(alarms[patient_feature_matrix$death_in_stay == "died"], 
+       #alarms[patient_feature_matrix$death_in_stay == "survived"])
+wilcox.test(alarms[patient_feature_matrix$death_in_stay == "died"], 
+       alarms[patient_feature_matrix$death_in_stay == "survived"])
+
+activity = patient_feature_matrix$chartindicator_31
+hist(activity)
+wilcox.test(activity[patient_feature_matrix$death_in_stay == "died"], 
+       activity[patient_feature_matrix$death_in_stay == "survived"])
+
+respiratory_rate = patient_feature_matrix$chartvalue_618
+hist(respiratory_rate)
+t.test(respiratory_rate[patient_feature_matrix$death_in_stay == "died"], 
+       respiratory_rate[patient_feature_matrix$death_in_stay == "survived"])
+wilcox.test(respiratory_rate[patient_feature_matrix$death_in_stay == "died"], 
+       respiratory_rate[patient_feature_matrix$death_in_stay == "survived"])
+
+arterial_PaCO2 = patient_feature_matrix$chartvalue_778
+hist(arterial_PaCO2)
+t.test(arterial_PaCO2[patient_feature_matrix$death_in_stay == "died"], 
+       arterial_PaCO2[patient_feature_matrix$death_in_stay == "survived"])
+wilcox.test(arterial_PaCO2[patient_feature_matrix$death_in_stay == "died"], 
+       arterial_PaCO2[patient_feature_matrix$death_in_stay == "survived"])
+
+oxy_drop_matrix = patient_feature_matrix %>%
+  group_by(death_in_stay,oxy_drop) %>%
+  summarise(n=n())%>%
+  pull(n)%>%
+  matrix(ncol=2)
+fisher.test(oxy_drop_matrix)
+chisq.test(oxy_drop_matrix)
+
+  
+snomed_ct_concept_matrix = patient_feature_matrix %>%
+  group_by(death_in_stay,patient_feature_matrix$C2720507) %>%
+  summarise(n=n())%>%
+  pull(n)%>%
+  matrix(ncol=2)
+fisher.test(snomed_ct_concept_matrix)
+chisq.test(snomed_ct_concept_matrix)
+```
+
+For `alarms` and `activity`, I choose to use rank-sum test, because these two features are with continuous values, and through the histograms checked before, neither of them obeys normal distribution, so that the t test is not applicable. The p value for rank-sum test of `alarms` is 0.07161, which is larger than 0.05, the p value for `activity` is 0.1854, which is also larger than 0.05. Both `alarms` and `activity` are not significantly associated with mortality.
+
+For `respiratory rate`and `arterial PaCO2`, both t test and rank-sum test are used, these two features are also with continuous values, plus the distribution is comparably normal. 
+For `respiratory rate`, the p value of the t test is 3.83e-11, the p value of rank-sum test is 1.669e-13, both of the p value are below 0.05, indicating that `respiratory rate` is significantly associated with mortality.
+For `arterial PaCO2`, the p value of the t test is 2.314e-15, the p value of rank-sum test is less than 2.2e-16, both of the p value are below 0.05, indicating that `arterial PaCO2` is significantly associated with mortality.
+
+For `oxy_drop` and `snomed ct concept`, both Fisher exact test and $\chi^2$ (chi squared) test can be applied, as these two features have dicrete values.
+For `oxy_drop`, the p value of the Fisher exact test is 3.571e-09, the p value for $\chi^2$ test is 1.939e-09, both of the p value are below 0.05, indicating that `oxy_drop` is significantly associated with mortality.
+For `snomed ct concept`, the p value of the Fisher exact test is 0.8422, the p value for $\chi^2$ test is 0.8487, both of the p value are larger than 0.05, indicating that `snomed ct concept` is not significantly associated with mortality.
+
+#### 2.1.2  Hypothesis testing with Bonferroni correction
+Perform statistical tests (t-test) to evaluate association of all chart value features with death during ICU stay as an outcome.  How many chart value features are significantly associated with death (according to a t-test) at the standard cutoff of 0.05?
+
+```{r}
+chartvalue_index=str_detect(colnames(patient_feature_lm),"chartvalue")
+patient_feature_lm_chartvalue=patient_feature_lm[,chartvalue_index]
+p=rep(NA,sum(chartvalue_index))
+names(p)=colnames(patient_feature_lm_chartvalue)
+for (i in 1:length(p)) {
+  p[i]=t.test(patient_feature_lm_chartvalue[patient_feature_matrix$death_in_stay == "died",i], 
+       patient_feature_lm_chartvalue[patient_feature_matrix$death_in_stay == "survived",i])$p.value
+}
+sum(p<=0.05)
+```
+
+
+```{r}
+B_pvalue=p.adjust(p,method="bonferroni")
+sum(B_pvalue<=0.05) 
+```
+
+### 2.2 Adjusted Analyses
+
+#### 2.2.1 Regression Models for Association
+
+
+```{r}
+outcome_character=as.factor(outcome_character)
+
+logistic1=glm(outcome_character ~ patient_feature_lm[,"age_in_days"]+patient_feature_lm[,"oxy_drop"], family = "binomial")
+
+logistic2=glm(outcome_character ~ patient_feature_lm[,"age_in_days"]+patient_feature_lm[,"gender"]+patient_feature_lm[,"oxy_drop"], family = "binomial")
+
+sigB_chartvalue=names(B_pvalue[B_pvalue<=0.05])
+logistic3=glm(outcome_character ~ patient_feature_lm[,"age_in_days"]+patient_feature_lm[,"gender"]+patient_feature_lm[,"oxy_drop"]+patient_feature_lm[,sigB_chartvalue], family = "binomial")
+```
+
+#### 2.2.2 Comparing regression models
+
+```{r}
+logistic1$coefficients[3]
+logistic2$coefficients[4]
+logistic3$coefficients[4]
+confint(logistic1,level = 0.95)[3,]
+confint(logistic2,level = 0.95)[4,]
+confint(logistic3,level = 0.95)[4,]
+```
+
+
+#### 2.2.3 Legitimancy of Confidence Intervals
+
+#### 2.2.4 Goodness-of-fit testing
+
+```{r}
+anova(logistic1,logistic2,test = "Chisq")
+anova(logistic1,logistic3,test = "Chisq")
+anova(logistic2,logistic3,test = "Chisq")
+```
+
+### 2.3 Survival Analysis
+
+#### 2.3.1 Creating Survival Data
+
+```{r}
+cohort = cohort %>%
+  mutate(survival_time= difftime(censor_time, index_time, units = "days"))
+patients_survivial = data.frame(subject_id=cohort$subject_id,
+                                oxy_drop=cohort$oxy_drop,
+                                survival_time=cohort$survival_time,
+                                status=cohort$death_in_stay)
+```
+
+
+#### 2.3.2 Kaplan-Meier Curves
+
+```{r}
+library(survival)
+library(survminer)
+patients_survivial$status=ifelse(patients_survivial$status=="died",1,0)
+KM0 <- survfit(Surv(survival_time, status) ~ 1, data=patients_survivial)
+ggsurvplot(KM0)
+```
+
+```{r}
+fit <- survfit(Surv(survival_time, status) ~ oxy_drop, patients_survivial)
+ggsurvplot(fit, data = patients_survivial,censor.shape="|", censor.size = 4)
+```
+
+#### 2.3.3  Cox Proportional Hazards Models
+
+```{r}
+res.cox <- coxph(Surv(survival_time, status) ~ oxy_drop, patients_survivial)
+res.cox
+res.cox$coefficients
+confint(res.cox,level = 0.95)
+
+res.cox_nonzero <- coxph(Surv(survival_time, status) ~ oxy_drop + patient_feature_lm[,-1], patients_survivial)
+res.cox_nonzero$coefficients[1]
+confint(res.cox_nonzero,level = 0.95)[1,]
+```
+
+First model:
+The coefficient of oxy drop:-0.049, CI:(-0.213,0.115)
+Second model:
+The coefficient of oxy drop:0.273, CI:(0.110,0.435)
+
+Explanation for the difference in the results: The coefficients for oxy drop of the two models are very different, the first model is -0.049, and the second model is 0.273. Their respective confidence intervals are also different. The reason for the difference is due to the large number of variables adjusted at the second model, and some of them are associated with oxy drop.
